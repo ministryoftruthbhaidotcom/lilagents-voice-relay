@@ -1,0 +1,22 @@
+# One-click deploy on Render (https://render.com). Push this repo, then "New +" →
+# "Blueprint" and point it at this folder. Set the secret env vars in the dashboard.
+services:
+  - type: web
+    name: lilagents-voice-relay
+    runtime: node
+    rootDir: voice-relay
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false            # set in dashboard — never commit it
+      - key: EXCLUSIVE_DOWNLOAD_URL
+        sync: false
+      - key: INVITE_CODES
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: LIVE_MODEL
+        value: gemini-3.1-flash-live-preview

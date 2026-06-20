@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this to codes.json and edit. Each key is an invite code you hand out. Set active:false to revoke instantly (the relay re-reads this file on every request — no restart). codes.json is gitignored so your live codes never get committed.",
+  "codes": {
+    "AGENT-ALPHA-7Q2K": { "note": "for Riya — issued 2026-06-19", "active": true },
+    "AGENT-BRAVO-9XM4": { "note": "for Dev — issued 2026-06-19", "active": true },
+    "AGENT-OLD-0000":   { "note": "example of a revoked code", "active": false }
+  }
+}

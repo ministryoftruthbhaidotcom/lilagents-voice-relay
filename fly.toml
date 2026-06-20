@@ -1,0 +1,27 @@
+# Fly.io config. Deploy from this folder:
+#   fly launch --no-deploy        (creates the app; accept this fly.toml)
+#   fly secrets set GEMINI_API_KEY=AIza... EXCLUSIVE_DOWNLOAD_URL=https://... INVITE_CODES=CODE1,CODE2 ALLOWED_ORIGINS=https://yoursite
+#   fly deploy
+app = "lilagents-voice-relay"
+primary_region = "iad"          # pick a region near you / your users
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8787"
+  LIVE_MODEL = "gemini-3.1-flash-live-preview"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  # Keep one machine always running so a voice call never waits on a cold start.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
