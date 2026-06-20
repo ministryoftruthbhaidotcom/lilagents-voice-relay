@@ -4,7 +4,6 @@ services:
   - type: web
     name: lilagents-voice-relay
     runtime: node
-    rootDir: voice-relay
     plan: free
     buildCommand: npm install
     startCommand: npm start
