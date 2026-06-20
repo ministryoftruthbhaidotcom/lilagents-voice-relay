@@ -194,6 +194,58 @@ app.get('/spotify', limiter, async (req, res) => {
   }
 });
 
+// Resolve a query to the top YouTube video (keyless — parses the results page). Opening
+// the resulting watch URL autoplays the video in the browser, so this is the universal
+// "actually play it" path (no API key, no Premium, works for everyone).
+async function youtubeTop(q) {
+  const r = await fetch(`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+  if (!r.ok) return null;
+  const html = await r.text();
+  const idm = html.match(/"videoId":"([\w-]{11})"/);
+  if (!idm) return null;
+  const id = idm[1];
+  let label = '';
+  const tm = html.match(new RegExp(`"videoId":"${id}"[\\s\\S]{0,800}?"title":\\{"runs":\\[\\{"text":"((?:[^"\\\\]|\\\\.)*)"`));
+  if (tm) { try { label = JSON.parse('"' + tm[1] + '"'); } catch { label = tm[1]; } }
+  return { url: `https://www.youtube.com/watch?v=${id}`, label };
+}
+
+// GET /play?code=INVITE&q=QUERY  ->  { spotify:{id,label}|null, youtube:{url,label}|null }
+// The app PLAYS the result: spotify:track:<id> if a Premium-owner Spotify match exists and
+// Spotify is installed, otherwise it opens the YouTube watch URL (which autoplays).
+app.get('/play', limiter, async (req, res) => {
+  const verdict = checkCode(req.query.code);
+  if (!verdict.ok) return res.status(403).json({ error: verdict.reason });
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'no query' });
+
+  const out = { spotify: null, youtube: null };
+  try {
+    const tok = await spotifyAppToken();
+    if (tok) {
+      const r = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${encodeURIComponent(q)}`,
+        { headers: { Authorization: `Bearer ${tok}` } });
+      if (r.ok) {
+        const t = (await r.json()).tracks?.items?.[0];
+        if (t) {
+          const artist = (t.artists || []).map((a) => a.name).join(', ');
+          out.spotify = { id: t.id, label: artist ? `${t.name} — ${artist}` : t.name };
+        }
+      } // a 403 here just means the owner isn't Premium — fall through to YouTube
+    }
+  } catch { /* ignore — YouTube covers it */ }
+  try { out.youtube = await youtubeTop(q); } catch { /* ignore */ }
+
+  if (!out.spotify && !out.youtube) return res.status(404).json({ error: 'nothing found' });
+  console.log(`[play] "${q}" -> spotify:${out.spotify?.id || '-'} youtube:${out.youtube?.url || '-'}`);
+  return res.json(out);
+});
+
 // ── /live WebSocket proxy: app <—bridge—> Gemini Live ────────────────────────
 const GEMINI_WS = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
