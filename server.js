@@ -145,6 +145,55 @@ app.post('/session', limiter, (req, res) => {
   return res.json({ model: MODEL, voice, wsUrl });
 });
 
+// ── Spotify resolver: "play X" → the top track, so the app can actually PLAY it ──
+// The app opens `spotify:track:<id>` (which the desktop client starts playing) instead of
+// just `spotify:search:<q>` (which only opens a search page). We resolve the query here with
+// Spotify's Client-Credentials flow so the app never holds Spotify secrets. Configure with
+// SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET (a free app at developer.spotify.com). If unset,
+// the endpoint returns 503 and the app gracefully falls back to opening Spotify search.
+let _spToken = { value: null, expiresAt: 0 };
+async function spotifyAppToken() {
+  const id = process.env.SPOTIFY_CLIENT_ID, secret = process.env.SPOTIFY_CLIENT_SECRET;
+  if (!id || !secret) return null;
+  if (_spToken.value && Date.now() < _spToken.expiresAt) return _spToken.value;
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  _spToken = { value: j.access_token, expiresAt: Date.now() + Math.max(0, (j.expires_in || 3600) - 60) * 1000 };
+  return _spToken.value;
+}
+
+// GET /spotify?code=INVITE&q=QUERY  ->  { id, uri, name, artist }
+app.get('/spotify', limiter, async (req, res) => {
+  const verdict = checkCode(req.query.code);
+  if (!verdict.ok) return res.status(403).json({ error: verdict.reason });
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'no query' });
+  const tok = await spotifyAppToken();
+  if (!tok) return res.status(503).json({ error: 'spotify not configured' });
+  try {
+    const r = await fetch(
+      `https://api.spotify.com/v1/search?type=track&limit=1&q=${encodeURIComponent(q)}`,
+      { headers: { Authorization: `Bearer ${tok}` } });
+    if (!r.ok) return res.status(502).json({ error: `spotify search ${r.status}` });
+    const j = await r.json();
+    const t = j.tracks?.items?.[0];
+    if (!t) return res.status(404).json({ error: 'no track found' });
+    const artist = (t.artists || []).map((a) => a.name).join(', ');
+    console.log(`[spotify] "${q}" -> ${t.name} — ${artist}`);
+    return res.json({ id: t.id, uri: t.uri, name: t.name, artist });
+  } catch (e) {
+    return res.status(502).json({ error: 'spotify error' });
+  }
+});
+
 // ── /live WebSocket proxy: app <—bridge—> Gemini Live ────────────────────────
 const GEMINI_WS = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
