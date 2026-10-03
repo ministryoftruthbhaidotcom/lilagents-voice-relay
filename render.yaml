@@ -4,13 +4,17 @@ services:
   - type: web
     name: lilagents-voice-relay
     runtime: node
-    plan: free
+    # MUST stay "starter" ($7/mo). The free instance type scales to zero after ~15 min idle and
+    # then takes ~20-30s to wake, measured 22.5s, which the user hears as dead air before the
+    # morning brief starts speaking. This file is what a Blueprint deploy applies, so leaving it
+    # as "free" would silently undo the upgrade on the next blueprint sync.
+    plan: starter
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: GEMINI_API_KEY
-        sync: false            # set in dashboard — never commit it
+        sync: false            # set in dashboard, never commit it
       - key: EXCLUSIVE_DOWNLOAD_URL
         sync: false
       - key: INVITE_CODES

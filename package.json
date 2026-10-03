@@ -2,7 +2,7 @@
   "name": "lilagents-voice-relay",
   "version": "1.0.0",
   "private": true,
-  "description": "Invite-gated relay that mints short-lived Gemini Live ephemeral tokens for the lil agents exclusive build. The real API key never leaves this server.",
+  "description": "Invite-gated relay that mints short-lived Gemini Live ephemeral tokens for the Taskies exclusive build. The real API key never leaves this server.",
   "type": "module",
   "main": "server.js",
   "scripts": {

@@ -1,7 +1,7 @@
-# lil agents — Voice Relay
+# Taskies, Voice Relay
 
 A tiny invite-gated **WebSocket proxy** in front of the **Gemini Live API** for the
-exclusive ("Pro voice") build of lil agents. Gemini Live has a **free tier**, which
+exclusive ("Pro voice") build of Taskies. Gemini Live has a **free tier**, which
 makes it ideal for testing.
 
 **Why it exists:** the real `GEMINI_API_KEY` must never ship inside the distributed
@@ -62,7 +62,7 @@ dashboard (do **not** upload `.env`). Examples:
 
 | Method | Path | Body / Query | Returns |
 |---|---|---|---|
-| GET  | `/health` | — | `{ ok: true }` |
+| GET  | `/health` |, | `{ ok: true }` |
 | POST | `/session` | `{ code, character }` | `{ model, voice, wsUrl }` |
 | POST | `/verify`  | `{ code }` | `{ ok, downloadUrl }` (website gate) |
 | WS   | `/live`    | `?code=INVITE` | bridged Gemini Live stream |

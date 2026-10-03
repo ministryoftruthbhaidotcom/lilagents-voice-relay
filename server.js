@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// lil agents — Voice Relay
+// Taskies, Voice Relay
 //
 // A tiny, invite-gated WebSocket PROXY in front of Google's Gemini Live API for the
 // exclusive ("Pro voice") build of the app. The whole point:
@@ -9,10 +9,10 @@
 //     decompiling the app.
 //   • The app opens a WebSocket to THIS relay at /live?code=INVITE_CODE. The relay
 //     checks the code, opens its own WebSocket to Gemini (authenticated with the real
-//     key, server-side), and bridges audio/JSON frames between the two — transparently,
+//     key, server-side), and bridges audio/JSON frames between the two, transparently,
 //     so the app speaks the normal Gemini Live protocol and never sees the key.
 //   • Revoke anyone instantly by flipping their code to "active": false in
-//     codes.json (hot-reloaded every request — no restart/redeploy needed).
+//     codes.json (hot-reloaded every request, no restart/redeploy needed).
 //
 // Deploy anywhere that runs Node 18+ (Render, Fly.io, Railway, a small VM).
 // See README.md.
@@ -30,7 +30,7 @@ import { dirname, join } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config (all via env so nothing secret is committed) ──────────────────────
-// Uses Google's Gemini Live API (it has a genuinely free tier — good for testing).
+// Uses Google's Gemini Live API (it has a genuinely free tier, good for testing).
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PORT           = process.env.PORT || 8787;
 // Live model + per-character prebuilt voices. The client sets the voice in its setup
@@ -47,7 +47,7 @@ if (!GEMINI_API_KEY) {
 
 // ── Invite codes ─────────────────────────────────────────────────────────────
 // codes.json is re-read on every request so you can grant/revoke access by simply
-// editing the file — no redeploy. Shape:
+// editing the file, no redeploy. Shape:
 //   { "codes": { "ABCD-1234": { "note": "for Riya", "active": true } } }
 // Optionally seed from the INVITE_CODES env var (comma-separated) for quick tests.
 function loadCodes() {
@@ -58,7 +58,7 @@ function loadCodes() {
       map.set(normalize(code), { active: meta.active !== false, note: meta.note || '' });
     }
   } catch {
-    /* no codes.json yet — fall back to env only */
+    /* no codes.json yet, fall back to env only */
   }
   for (const code of (process.env.INVITE_CODES || '').split(',')) {
     const c = normalize(code);
@@ -106,11 +106,53 @@ const limiter = rateLimit({
   message: { error: 'too many attempts, slow down' },
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// `build` is bumped by hand when this file changes, so a deploy can be confirmed from outside
+// (the app only cares about `ok`).
+app.get('/health', (_req, res) => res.json({ ok: true, build: 3 }));
+
+// ── The shared Gemini voice quota ─────────────────────────────────────────────────────────────
+// Every user's call runs on the one GEMINI_API_KEY above. When its quota runs out, Google closes
+// each new call, so voice stops for everyone at once, and nobody found out until someone
+// complained. The relay notes each time that happens; GET /status tells the owner's /stats page,
+// which shows a banner. Only times and a count leave here: no codes, no users, no key.
+const QUOTA_WINDOW_MS = 24 * 60 * 60 * 1000;
+const quotaHits = [];                       // times (ms) a call was refused for quota, last 24 h
+const startedAt = new Date().toISOString();
+
+function isQuotaReason(text) {
+  const t = String(text || '').toLowerCase();
+  // Not "exceeded" alone: Google also closes with "Deadline exceeded", a timeout, not a quota.
+  return t.includes('quota') || t.includes('resource_exhausted') || t.includes('resource has been exhausted')
+      || /\b429\b/.test(t) || t.includes('rate limit');
+}
+
+function noteQuotaHit(code) {
+  const now = Date.now();
+  quotaHits.push(now);
+  while (quotaHits.length && now - quotaHits[0] > QUOTA_WINDOW_MS) quotaHits.shift();
+  if (quotaHits.length > 5000) quotaHits.splice(0, quotaHits.length - 5000);
+  console.warn(`[${code}] ⚠ Gemini voice quota refused this call (${quotaHits.length} in the last 24 h)`);
+}
+
+// Public and read-only, so any page may read it (the website's /stats does, from the browser).
+app.get('/status', (_req, res) => {
+  const now = Date.now();
+  while (quotaHits.length && now - quotaHits[0] > QUOTA_WINDOW_MS) quotaHits.shift();
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    voiceQuota: {
+      lastHitAt: quotaHits.length ? new Date(quotaHits[quotaHits.length - 1]).toISOString() : null,
+      hitsLast24h: quotaHits.length,
+    },
+    since: startedAt,               // counts start when the relay last (re)started
+  });
+});
 
 // POST /verify  { code }  ->  { ok, downloadUrl }
 // Used by the website's invite gate to check a code and reveal the exclusive build's
-// download link. No cost — it only validates the code.
+// download link. No cost, it only validates the code.
 app.post('/verify', limiter, (req, res) => {
   const verdict = checkCode(req.body?.code);
   if (!verdict.ok) {
@@ -187,14 +229,14 @@ app.get('/spotify', limiter, async (req, res) => {
     const t = j.tracks?.items?.[0];
     if (!t) return res.status(404).json({ error: 'no track found' });
     const artist = (t.artists || []).map((a) => a.name).join(', ');
-    console.log(`[spotify] "${q}" -> ${t.name} — ${artist}`);
+    console.log(`[spotify] "${q}" -> ${t.name}, ${artist}`);
     return res.json({ id: t.id, uri: t.uri, name: t.name, artist });
   } catch (e) {
     return res.status(502).json({ error: 'spotify error' });
   }
 });
 
-// Resolve a query to the top YouTube video (keyless — parses the results page). Opening
+// Resolve a query to the top YouTube video (keyless, parses the results page). Opening
 // the resulting watch URL autoplays the video in the browser, so this is the universal
 // "actually play it" path (no API key, no Premium, works for everyone).
 async function youtubeTop(q) {
@@ -234,11 +276,11 @@ app.get('/play', limiter, async (req, res) => {
         const t = (await r.json()).tracks?.items?.[0];
         if (t) {
           const artist = (t.artists || []).map((a) => a.name).join(', ');
-          out.spotify = { id: t.id, label: artist ? `${t.name} — ${artist}` : t.name };
+          out.spotify = { id: t.id, label: artist ? `${t.name}, ${artist}` : t.name };
         }
-      } // a 403 here just means the owner isn't Premium — fall through to YouTube
+      } // a 403 here just means the owner isn't Premium, fall through to YouTube
     }
-  } catch { /* ignore — YouTube covers it */ }
+  } catch { /* ignore, YouTube covers it */ }
   try { out.youtube = await youtubeTop(q); } catch { /* ignore */ }
 
   if (!out.spotify && !out.youtube) return res.status(404).json({ error: 'nothing found' });
@@ -246,7 +288,7 @@ app.get('/play', limiter, async (req, res) => {
   return res.json(out);
 });
 
-// ── /live WebSocket proxy: app <—bridge—> Gemini Live ────────────────────────
+// ── /live WebSocket proxy: app <-bridge-> Gemini Live ────────────────────────
 const GEMINI_WS = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
 const server = http.createServer(app);
@@ -272,15 +314,26 @@ server.on('upgrade', (req, socket, head) => {
 
 // Bridges one app connection to a fresh Gemini Live connection, forwarding frames
 // both ways verbatim. The app drives the protocol (setup/realtimeInput/…); the relay
-// just pipes — so the key stays here and the app speaks vanilla Gemini Live.
+// just pipes, so the key stays here and the app speaks vanilla Gemini Live.
 function bridge(clientWs, code) {
   const upstream = new WebSocket(GEMINI_WS);
   const pending = [];                       // app frames that arrive before upstream is open
   let open = false;
   const stats = { up: 0, upAudio: 0, down: 0, downAudio: 0 };
 
+  // Audio frames are big (base64 PCM) and constant: several every second in each direction, for
+  // every caller on the box. Parsing each one only to decide not to print it burned the relay's
+  // CPU and added jitter to the very stream it was logging, which the caller hears as the voice
+  // breaking up. Anything over this size is audio for logging purposes: counted, never parsed.
+  const AUDIO_SIZE_HINT = 2048;
+
   // Summarize a frame for the live terminal view (don't dump base64 audio).
   const summarize = (data, dir) => {
+    if (data.length > AUDIO_SIZE_HINT) {
+      const up = dir === '→';
+      const n = up ? ++stats.upAudio : ++stats.downAudio;
+      return n % 50 === 1 ? `${dir} audio  (#${n}, ${Math.round(data.length / 1024)} KB)` : null;
+    }
     let s; try { s = JSON.parse(data.toString()); } catch { return `${dir} <binary ${data.length}b>`; }
     const k = Object.keys(s).join(',');
     if (s.realtimeInput?.audio)            { stats.upAudio++;   return stats.upAudio % 50 === 1 ? `${dir} audio  (#${stats.upAudio})` : null; }
@@ -313,8 +366,19 @@ function bridge(clientWs, code) {
     stats.down++; logFrame(data, '←');
     if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
   });
-  upstream.on('close', (c, r) => { console.log(`[${code}] upstream closed ${c} ${String(r).slice(0,80)} | totals up=${stats.up}(audio ${stats.upAudio}) down=${stats.down}(audio ${stats.downAudio})`); try { clientWs.close(c >= 1000 && c <= 4999 ? c : 1011, String(r).slice(0, 100)); } catch {} });
-  upstream.on('error', (e) => { console.error(`[${code}] upstream error`, e.message); try { clientWs.close(1011); } catch {} });
+  upstream.on('close', (c, r) => {
+    console.log(`[${code}] upstream closed ${c} ${String(r).slice(0,80)} | totals up=${stats.up}(audio ${stats.upAudio}) down=${stats.down}(audio ${stats.downAudio})`);
+    if (c !== 1000 && isQuotaReason(r)) noteQuotaHit(code);
+    try { clientWs.close(c >= 1000 && c <= 4999 ? c : 1011, String(r).slice(0, 100)); } catch {}
+  });
+  // A quota refusal can also come before the socket opens, as an HTTP 429 ("Unexpected server
+  // response: 429"). The app is told the reason too, so it can say "today's limit" in words.
+  upstream.on('error', (e) => {
+    console.error(`[${code}] upstream error`, e.message);
+    const quota = isQuotaReason(e.message);
+    if (quota) noteQuotaHit(code);
+    try { clientWs.close(1011, quota ? 'quota exceeded' : undefined); } catch {}
+  });
 
   clientWs.on('message', (data, isBinary) => {
     stats.up++; logFrame(data, '→');
@@ -328,5 +392,5 @@ function bridge(clientWs, code) {
 }
 
 server.listen(PORT, () => {
-  console.log(`lil agents voice relay listening on :${PORT} (model=${MODEL})`);
+  console.log(`Taskies voice relay listening on :${PORT} (model=${MODEL})`);
 });

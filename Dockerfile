@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 
-# App source. NOTE: .env and codes.json are gitignored / not copied — provide secrets
+# App source. NOTE: .env and codes.json are gitignored / not copied, provide secrets
 # as host environment variables, and manage codes via codes.json mounted at runtime or
 # the INVITE_CODES env var.
 COPY server.js ./
