@@ -66,6 +66,8 @@ dashboard (do **not** upload `.env`). Examples:
 | POST | `/session` | `{ code, character }` | `{ model, voice, wsUrl }` |
 | POST | `/verify`  | `{ code }` | `{ ok, downloadUrl }` (website gate) |
 | WS   | `/live`    | `?code=INVITE` | bridged Gemini Live stream |
+| POST | `/generate` | headers `x-invite-code`, `x-client-id`; `{ model, request }` | Gemini's `generateContent` answer, on this key (PC tasks, when the user's own key is refused); 429 `RELAY_CAP` past the daily caps |
+| POST | `/music`   | `{ code, title, styles, sections: [{ name, lines, seconds }] }` | the special-day song as `audio/mpeg` (ElevenLabs Music) |
 
 `character`: `"jazz"` = Hope (voice `Aoede`), anything else = Josh (voice `Charon`).
 
@@ -74,3 +76,11 @@ dashboard (do **not** upload `.env`). Examples:
 See [.env.example](.env.example). Key knobs: `GEMINI_API_KEY`, `LIVE_MODEL`,
 `VOICE_JOSH`, `VOICE_HOPE` (Gemini voices: Aoede, Charon, Kore, Puck…),
 `EXCLUSIVE_DOWNLOAD_URL`, `ALLOWED_ORIGINS`, `TOKEN_TTL_SECONDS`.
+`/generate` caps: `GENERATE_PER_CLIENT_DAY` (default 300 requests per install per UTC day, about 20 PC
+tasks), `GENERATE_TOTAL_DAY` (default 3000 for everyone), `GENERATE_MODELS` (the models it forwards).
+
+Special-day songs (`/music`): `ELEVENLABS_API_KEY` (unset = the endpoint answers 503 and the app
+skips the song), `MUSIC_MODEL` (`music_v1` default, or `music_v2`), `MUSIC_DAILY_CAP` (songs a day
+for everyone together, default 2), `MUSIC_PER_IP_DAY` (default 3), `MUSIC_MAX_SECONDS` (default
+60). Every song is paid for by the key's ElevenLabs account; give the key Music access only and a
+credit limit. Lyrics are never logged.
