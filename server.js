@@ -118,7 +118,7 @@ const limiter = rateLimit({
 
 // `build` is bumped by hand when this file changes, so a deploy can be confirmed from outside
 // (the app only cares about `ok`).
-app.get('/health', (_req, res) => res.json({ ok: true, build: 9 }));
+app.get('/health', (_req, res) => res.json({ ok: true, build: 10 }));
 
 // ── The shared Gemini voice quota ─────────────────────────────────────────────────────────────
 // Every user's call runs on the one GEMINI_API_KEY above. When its quota runs out, Google closes
@@ -177,22 +177,37 @@ function noteQuotaHit(code, billing = false) {
 // the fewest calls right now, the one used longest ago on a tie (a PC-task step, which holds no
 // call, just takes the one used longest ago). The names (free1..freeN, paid) are all that leaves
 // this file; the keys themselves never do.
-const KEYS = FREE_KEYS.map((key, i) => ({ name: FREE_KEYS.length === 1 ? 'free' : `free${i + 1}`, key, paid: false, restUntil: 0, active: 0, lastUsed: 0 }));
+//
+// A key rests only for the kind of request it was refused for (its "lane"): calls ('live'), or one
+// model's steps, with or without Google Search ('gen:<model>' / 'gen:<model>:search'). Google's
+// limits are kept that way too: on 2026-10-22 the free projects answered calls and plain steps but
+// refused every search (no free search allowance for them), and one search then rested all five
+// keys for calls as well, which would have put the next ten minutes of calls on the paid key.
+const KEYS = FREE_KEYS.map((key, i) => ({ name: FREE_KEYS.length === 1 ? 'free' : `free${i + 1}`, key, paid: false, rests: new Map(), active: 0, lastUsed: 0 }));
 if (GEMINI_API_KEY_PAID && !FREE_KEYS.includes(GEMINI_API_KEY_PAID))
-  KEYS.push({ name: 'paid', key: GEMINI_API_KEY_PAID, paid: true, restUntil: 0, active: 0, lastUsed: 0 });
+  KEYS.push({ name: 'paid', key: GEMINI_API_KEY_PAID, paid: true, rests: new Map(), active: 0, lastUsed: 0 });
 const KEY_REST_MS = Math.max(0.05, Number(process.env.KEY_REST_MINUTES) || 10) * 60 * 1000;   // fractions for tests
-const keyRefusals = [];                     // { at, name }, last 24 h: a key refused and the next one tried
+const keyRefusals = [];                     // { at, name, lane }, last 24 h: a key refused and the next one tried
+
+/** When `entry` may be tried first again for `lane` (0: now). */
+const restUntil = (entry, lane) => entry.rests.get(lane) || 0;
+
+/** The lane of a /generate step: its model, and whether it searches the web. */
+function generateLane(model, request) {
+  const searches = Array.isArray(request?.tools) && request.tools.some(t => t && (t.google_search || t.googleSearch));
+  return `gen:${model}${searches ? ':search' : ''}`;
+}
 
 /**
- * The keys to try, in order: the free ones that aren't resting, least busy first, then the paid
- * one, then the resting ones (free before paid). Each key appears once.
+ * The keys to try for `lane`, in order: the free ones that aren't resting, least busy first, then
+ * the paid one, then the resting ones (free before paid). Each key appears once.
  */
-function keyOrder(now = Date.now()) {
+function keyOrder(lane = 'live', now = Date.now()) {
   const byLoad = (a, b) => a.active - b.active || a.lastUsed - b.lastUsed;
-  const awake = KEYS.filter(k => k.restUntil <= now), resting = KEYS.filter(k => k.restUntil > now);
+  const awake = KEYS.filter(k => restUntil(k, lane) <= now), resting = KEYS.filter(k => restUntil(k, lane) > now);
   return [
     ...awake.filter(k => !k.paid).sort(byLoad), ...awake.filter(k => k.paid),
-    ...resting.filter(k => !k.paid).sort((a, b) => a.restUntil - b.restUntil), ...resting.filter(k => k.paid),
+    ...resting.filter(k => !k.paid).sort((a, b) => restUntil(a, lane) - restUntil(b, lane)), ...resting.filter(k => k.paid),
   ];
 }
 
@@ -202,14 +217,15 @@ function releaseKey(entry) { if (entry && entry.active > 0) entry.active--; }
 
 function keyByName(name) { return KEYS.find(k => k.name === name); }
 
-function noteKeyRefused(entry, reason, who) {
+function noteKeyRefused(entry, reason, who, lane) {
   const now = Date.now();
-  entry.restUntil = now + KEY_REST_MS;
-  keyRefusals.push({ at: now, name: entry.name });
+  entry.rests.set(lane, now + KEY_REST_MS);
+  for (const [l, until] of entry.rests) if (until <= now) entry.rests.delete(l);   // kept small
+  keyRefusals.push({ at: now, name: entry.name, lane });
   while (keyRefusals.length && now - keyRefusals[0].at > QUOTA_WINDOW_MS) keyRefusals.shift();
   if (keyRefusals.length > 5000) keyRefusals.splice(0, keyRefusals.length - 5000);
   const why = isBillingReason(reason) ? 'billing' : isQuotaReason(reason) ? 'quota' : 'the key itself';
-  console.warn(`[${who}] the ${entry.name} key was refused (${why}), trying the next one; it rests ${KEY_REST_MS / 60000} min`);
+  console.warn(`[${who}] the ${entry.name} key was refused (${why}) for ${lane}, trying the next one; it rests ${KEY_REST_MS / 60000} min for that`);
 }
 
 function keyStats(now) {
@@ -220,12 +236,14 @@ function keyStats(now) {
     paidConfigured: KEYS.some(k => k.paid),
     freeRefusedLast24h: keyRefusals.filter(r => r.name !== 'paid').length,
     paidRefusedLast24h: keyRefusals.filter(r => r.name === 'paid').length,
-    freeRestingNow: free.every(k => k.restUntil > now),      // all of them: calls are on the paid key
+    freeRestingNow: free.every(k => restUntil(k, 'live') > now),   // for calls, all of them: calls are on the paid key
     each: KEYS.map(k => ({                                    // names and counts only, never a key
       name: k.name,
       callsNow: k.active,
-      restingNow: k.restUntil > now,
+      restingNow: restUntil(k, 'live') > now,                 // for calls
+      restingFor: [...k.rests].filter(([, until]) => until > now).map(([lane]) => lane),   // every lane it rests for
       refusedLast24h: keyRefusals.filter(r => r.name === k.name).length,
+      callsRefusedLast24h: keyRefusals.filter(r => r.name === k.name && r.lane === 'live').length,
     })),
   };
 }
@@ -538,7 +556,8 @@ app.post('/generate', generateBurst, express.json({ limit: '6mb' }), async (req,
   noteTime(generateTimes, now);
 
   const body = JSON.stringify(request);
-  const order = keyOrder(now);
+  const lane = generateLane(model, request);
+  const order = keyOrder(lane, now);
   try {
     for (let i = 0; ; i++) {
       order[i].lastUsed = Date.now();       // the next step goes to another free key
@@ -552,7 +571,7 @@ app.post('/generate', generateBurst, express.json({ limit: '6mb' }), async (req,
       // Refused for the limit, for money or over the key: the same step on the next key. Anything
       // else (a bad request, Google busy) would fail there too, so it goes back to the app as it is.
       if (!r.ok && i + 1 < order.length && (r.status === 429 || isQuotaReason(text) || isKeyProblem(text))) {
-        noteKeyRefused(order[i], text, 'generate');
+        noteKeyRefused(order[i], text, 'generate', lane);
         continue;
       }
       if (!r.ok) {
@@ -819,7 +838,7 @@ server.on('upgrade', (req, socket, head) => {
 // what the app sent so far, so the app never sees the refusal, only a call that started.
 function bridge(clientWs, code) {
   const call = callStarted();
-  let order = keyOrder();
+  let order = keyOrder('live');
   let attempt = 0;                          // index in `order` of the key in use
   let upstream = null;
   let open = false;
@@ -872,7 +891,7 @@ function bridge(clientWs, code) {
   // started the conversation yet (after setupComplete it lives on this key's project).
   const tryNextKey = (reason) => {
     if (call.answered || call.appLeft || !replayable || attempt + 1 >= order.length) return false;
-    noteKeyRefused(order[attempt], reason, code);
+    noteKeyRefused(order[attempt], reason, code, 'live');
     attempt++;
     connect([...opening]);
     return true;
