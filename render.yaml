@@ -13,8 +13,12 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      - key: GEMINI_API_KEYS
+        sync: false            # set in dashboard, never commit them; free-tier keys, comma-separated, one per project
       - key: GEMINI_API_KEY
-        sync: false            # set in dashboard, never commit it
+        sync: false            # optional, one more free key (the setting used before GEMINI_API_KEYS)
+      - key: GEMINI_API_KEY_PAID
+        sync: false            # optional: a project with prepaid credit, used only when the free key is refused
       - key: EXCLUSIVE_DOWNLOAD_URL
         sync: false
       - key: INVITE_CODES

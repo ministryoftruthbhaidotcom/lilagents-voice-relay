@@ -30,8 +30,15 @@ import { dirname, join } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config (all via env so nothing secret is committed) ──────────────────────
-// Uses Google's Gemini Live API (it has a genuinely free tier, good for testing).
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Uses Google's Gemini Live API. The free keys are projects with NO billing, so Google's free tier
+// pays for everyday use: GEMINI_API_KEYS (several, comma-separated, each from its OWN project, since
+// the free limits are per project) and/or GEMINI_API_KEY (one, as before). GEMINI_API_KEY_PAID
+// (optional) is a project with prepaid credit, used only when every free one is refused: a paid
+// project gets no free allowance at all, so running everything on it spent ₹474 in one demo night.
+const FREE_KEYS = [...new Set([process.env.GEMINI_API_KEY, ...(process.env.GEMINI_API_KEYS || '').split(',')]
+  .map(k => String(k || '').trim()).filter(Boolean))];
+const GEMINI_API_KEY = FREE_KEYS[0];
+const GEMINI_API_KEY_PAID = (process.env.GEMINI_API_KEY_PAID || '').trim();
 const PORT           = process.env.PORT || 8787;
 // Live model + per-character prebuilt voices. The client sets the voice in its setup
 // message; these are just the defaults the relay reports. The native-audio model gives
@@ -41,7 +48,7 @@ const VOICE_JOSH   = process.env.VOICE_JOSH || 'Charon';  // calm / deeper
 const VOICE_HOPE   = process.env.VOICE_HOPE || 'Aoede';   // bright / warmer
 
 if (!GEMINI_API_KEY) {
-  console.error('FATAL: GEMINI_API_KEY is not set. Copy .env.example to .env and fill it in.');
+  console.error('FATAL: neither GEMINI_API_KEYS nor GEMINI_API_KEY is set. Copy .env.example to .env and fill it in.');
   process.exit(1);
 }
 
@@ -111,7 +118,7 @@ const limiter = rateLimit({
 
 // `build` is bumped by hand when this file changes, so a deploy can be confirmed from outside
 // (the app only cares about `ok`).
-app.get('/health', (_req, res) => res.json({ ok: true, build: 8 }));
+app.get('/health', (_req, res) => res.json({ ok: true, build: 9 }));
 
 // ── The shared Gemini voice quota ─────────────────────────────────────────────────────────────
 // Every user's call runs on the one GEMINI_API_KEY above. When its quota runs out, Google closes
@@ -138,6 +145,15 @@ function isBillingReason(text) {
   return t.includes('billing') || t.includes('prepay') || t.includes('credit') || t.includes('payment');
 }
 
+// The key itself refused (deleted, expired, its project shut off): another key may well work, so it
+// moves the call on too. Not counted as quota: it is a setup problem, and the owner's to fix.
+function isKeyProblem(text) {
+  const t = String(text || '').toLowerCase();
+  return t.includes('api key not valid') || t.includes('api_key_invalid') || t.includes('api key expired')
+      || t.includes('permission_denied') || t.includes('permission denied') || t.includes('unauthenticated')
+      || /\b(401|403)\b/.test(t);
+}
+
 function noteQuotaHit(code, billing = false) {
   const now = Date.now();
   for (const hits of billing ? [quotaHits, billingHits] : [quotaHits]) {
@@ -146,6 +162,72 @@ function noteQuotaHit(code, billing = false) {
     if (hits.length > 5000) hits.splice(0, hits.length - 5000);
   }
   console.warn(`[${code}] ⚠ Gemini refused this call for ${billing ? 'billing (credit or payment)' : 'quota'} (${quotaHits.length} in the last 24 h)`);
+}
+
+// ── Free keys first, shared out; the paid key when they're all refused ───────────────────────
+// Each call and PC-task step tries the keys in order and moves to the next only when Google
+// refuses one for its limit or for money (isQuotaReason): any other error would fail the same way
+// on every key. A refused key then rests, and is tried last, for KEY_REST_MINUTES, so while the
+// free tier is used up each call goes straight to the next key instead of failing once first.
+// Its quota and billing refusals are not noted above (noteQuotaHit): nobody's call failed. They
+// are counted here, so the owner sees how often a key was refused and the paid one stepped in.
+//
+// Several free keys, each its own project, share out the load: the free tier's limits (calls at
+// once, requests a minute and a day) are per project, so a new call goes to the free key carrying
+// the fewest calls right now, the one used longest ago on a tie (a PC-task step, which holds no
+// call, just takes the one used longest ago). The names (free1..freeN, paid) are all that leaves
+// this file; the keys themselves never do.
+const KEYS = FREE_KEYS.map((key, i) => ({ name: FREE_KEYS.length === 1 ? 'free' : `free${i + 1}`, key, paid: false, restUntil: 0, active: 0, lastUsed: 0 }));
+if (GEMINI_API_KEY_PAID && !FREE_KEYS.includes(GEMINI_API_KEY_PAID))
+  KEYS.push({ name: 'paid', key: GEMINI_API_KEY_PAID, paid: true, restUntil: 0, active: 0, lastUsed: 0 });
+const KEY_REST_MS = Math.max(0.05, Number(process.env.KEY_REST_MINUTES) || 10) * 60 * 1000;   // fractions for tests
+const keyRefusals = [];                     // { at, name }, last 24 h: a key refused and the next one tried
+
+/**
+ * The keys to try, in order: the free ones that aren't resting, least busy first, then the paid
+ * one, then the resting ones (free before paid). Each key appears once.
+ */
+function keyOrder(now = Date.now()) {
+  const byLoad = (a, b) => a.active - b.active || a.lastUsed - b.lastUsed;
+  const awake = KEYS.filter(k => k.restUntil <= now), resting = KEYS.filter(k => k.restUntil > now);
+  return [
+    ...awake.filter(k => !k.paid).sort(byLoad), ...awake.filter(k => k.paid),
+    ...resting.filter(k => !k.paid).sort((a, b) => a.restUntil - b.restUntil), ...resting.filter(k => k.paid),
+  ];
+}
+
+/** A call (or a step) is now on `entry`: counted against it until released. */
+function takeKey(entry) { entry.active++; entry.lastUsed = Date.now(); }
+function releaseKey(entry) { if (entry && entry.active > 0) entry.active--; }
+
+function keyByName(name) { return KEYS.find(k => k.name === name); }
+
+function noteKeyRefused(entry, reason, who) {
+  const now = Date.now();
+  entry.restUntil = now + KEY_REST_MS;
+  keyRefusals.push({ at: now, name: entry.name });
+  while (keyRefusals.length && now - keyRefusals[0].at > QUOTA_WINDOW_MS) keyRefusals.shift();
+  if (keyRefusals.length > 5000) keyRefusals.splice(0, keyRefusals.length - 5000);
+  const why = isBillingReason(reason) ? 'billing' : isQuotaReason(reason) ? 'quota' : 'the key itself';
+  console.warn(`[${who}] the ${entry.name} key was refused (${why}), trying the next one; it rests ${KEY_REST_MS / 60000} min`);
+}
+
+function keyStats(now) {
+  while (keyRefusals.length && now - keyRefusals[0].at > QUOTA_WINDOW_MS) keyRefusals.shift();
+  const free = KEYS.filter(k => !k.paid);
+  return {
+    freeKeys: free.length,
+    paidConfigured: KEYS.some(k => k.paid),
+    freeRefusedLast24h: keyRefusals.filter(r => r.name !== 'paid').length,
+    paidRefusedLast24h: keyRefusals.filter(r => r.name === 'paid').length,
+    freeRestingNow: free.every(k => k.restUntil > now),      // all of them: calls are on the paid key
+    each: KEYS.map(k => ({                                    // names and counts only, never a key
+      name: k.name,
+      callsNow: k.active,
+      restingNow: k.restUntil > now,
+      refusedLast24h: keyRefusals.filter(r => r.name === k.name).length,
+    })),
+  };
 }
 
 // ── Call counts, for the owner's daily status email ──────────────────────────────────────────
@@ -157,7 +239,7 @@ const calls = [];                           // { start, end, outcome, resumed },
 const MAX_CALLS_KEPT = 20000;
 
 function callStarted() {
-  const call = { start: Date.now(), end: 0, outcome: '', resumed: false, answered: false, sawSetup: false, appLeft: false };
+  const call = { start: Date.now(), end: 0, outcome: '', resumed: false, answered: false, sawSetup: false, appLeft: false, key: '' };
   calls.push(call);
   if (calls.length > MAX_CALLS_KEPT) calls.splice(0, calls.length - MAX_CALLS_KEPT);
   return call;
@@ -169,6 +251,8 @@ function callEnded(call, outcome) {
   if (call.end) return;
   call.end = Date.now();
   call.outcome = outcome;
+  releaseKey(call.keyEntry);                // the key's share goes to the next call
+  call.keyEntry = null;
 }
 
 function callStats(now) {
@@ -190,6 +274,7 @@ function callStats(now) {
     peakAtOnceLast24h: peak,
     droppedLast24h: count('dropped'),
     couldNotStartLast24h: count('no-start'),
+    onPaidLast24h: recent.filter(c => !c.resumed && c.key === 'paid').length,   // new calls the paid key carried
   };
 }
 
@@ -210,6 +295,7 @@ app.get('/status', (_req, res) => {
     calls: callStats(now),
     generate: generateStats(now),   // PC tasks' steps on the owner's key (POST /generate)
     music: musicStatus(),
+    keys: keyStats(now),            // how often the free key was refused and the paid one stepped in
     since: startedAt,               // counts start when the relay last (re)started
   });
 });
@@ -451,19 +537,30 @@ app.post('/generate', generateBurst, express.json({ limit: '6mb' }), async (req,
   generateUse.total++;
   noteTime(generateTimes, now);
 
+  const body = JSON.stringify(request);
+  const order = keyOrder(now);
   try {
-    const r = await fetch(`${GEMINI_REST}/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify(request),
-      signal: AbortSignal.timeout(60_000),
-    });
-    const text = await r.text();
-    if (!r.ok) {
-      generateUse.googleRefused++;
-      console.warn(`[generate] Gemini answered ${r.status} for ${model}`);
+    for (let i = 0; ; i++) {
+      order[i].lastUsed = Date.now();       // the next step goes to another free key
+      const r = await fetch(`${GEMINI_REST}/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': order[i].key },
+        body,
+        signal: AbortSignal.timeout(60_000),
+      });
+      const text = await r.text();
+      // Refused for the limit, for money or over the key: the same step on the next key. Anything
+      // else (a bad request, Google busy) would fail there too, so it goes back to the app as it is.
+      if (!r.ok && i + 1 < order.length && (r.status === 429 || isQuotaReason(text) || isKeyProblem(text))) {
+        noteKeyRefused(order[i], text, 'generate');
+        continue;
+      }
+      if (!r.ok) {
+        generateUse.googleRefused++;
+        console.warn(`[generate] Gemini answered ${r.status} for ${model}`);
+      }
+      return res.status(r.status).type('application/json').send(text);
     }
-    res.status(r.status).type('application/json').send(text);
   } catch (err) {
     console.warn(`[generate] could not reach Gemini: ${err.name}`);
     res.status(502).json({ error: 'the relay could not reach Gemini' });
@@ -668,7 +765,31 @@ app.post('/music', limiter, async (req, res) => {
 // ── /live WebSocket proxy: app <-bridge-> Gemini Live ────────────────────────
 // GEMINI_LIVE_WS_URL is for the relay's tests only (a stand-in Gemini on localhost); never set it on Render.
 const GEMINI_WS = process.env.GEMINI_LIVE_WS_URL ||
-  `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent';
+const liveUrl = (key) => `${GEMINI_WS}?key=${encodeURIComponent(key)}`;
+
+// A call carries on after Gemini closes its connection (about every 10 minutes) by sending the
+// handle Google gave it, and a handle only works on the project that issued it. So the relay
+// remembers which key each handle came from (in memory only, never shown anywhere) and a resumed
+// call goes back to that key, even if the free key has come back from its rest in the meantime.
+const HANDLE_TTL_MS = 3 * 60 * 60 * 1000;  // Google keeps a handle about 2 hours
+const MAX_HANDLES = 20000;
+const handleKeys = new Map();               // handle -> { name, at }, oldest first
+
+function rememberHandle(handle, name) {
+  const now = Date.now();
+  handleKeys.delete(handle);
+  handleKeys.set(handle, { name, at: now });
+  for (const [h, v] of handleKeys) {
+    if (now - v.at <= HANDLE_TTL_MS && handleKeys.size <= MAX_HANDLES) break;
+    handleKeys.delete(h);
+  }
+}
+
+function keyForHandle(handle) {
+  const v = handle ? handleKeys.get(handle) : undefined;
+  return v && Date.now() - v.at <= HANDLE_TTL_MS ? keyByName(v.name) : undefined;
+}
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -691,14 +812,23 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (clientWs) => bridge(clientWs, normalize(code)));
 });
 
-// Bridges one app connection to a fresh Gemini Live connection, forwarding frames
-// both ways verbatim. The app drives the protocol (setup/realtimeInput/…); the relay
-// just pipes, so the key stays here and the app speaks vanilla Gemini Live.
+// Bridges one app connection to Gemini Live, forwarding frames both ways verbatim. The app drives
+// the protocol (setup/realtimeInput/…); the relay just pipes, so the key stays here and the app
+// speaks vanilla Gemini Live. If Google refuses a key before it has answered the setup (its limit,
+// the credit used up, the key itself), the relay opens the call again on the next key and replays
+// what the app sent so far, so the app never sees the refusal, only a call that started.
 function bridge(clientWs, code) {
-  const upstream = new WebSocket(GEMINI_WS);
   const call = callStarted();
-  const pending = [];                       // app frames that arrive before upstream is open
+  let order = keyOrder();
+  let attempt = 0;                          // index in `order` of the key in use
+  let upstream = null;
   let open = false;
+  const pending = [];                       // app frames that arrive before upstream is open
+  // Every app frame until Google answers the setup, to replay on the next key. In practice only the
+  // setup itself: the app holds the mic until setupComplete. Past the cap the call stays on its key.
+  const opening = [];
+  const MAX_OPENING_FRAMES = 32;
+  let replayable = true;
   const stats = { up: 0, upAudio: 0, down: 0, downAudio: 0 };
 
   // Audio frames are big (base64 PCM) and constant: several every second in each direction, for
@@ -736,54 +866,114 @@ function bridge(clientWs, code) {
     return `${dir} {${k}}`;
   };
   const logFrame = (data, dir) => { const line = summarize(data, dir); if (line) console.log(`[${code}] ${line}`); };
+  const totals = () => `totals up=${stats.up}(audio ${stats.upAudio}) down=${stats.down}(audio ${stats.downAudio})`;
 
-  upstream.on('open', () => {
-    open = true;
-    for (const [data, isBinary] of pending) upstream.send(data, { binary: isBinary });
+  // Moves the call to the next key, if the refusal is one another key could fix and Google hasn't
+  // started the conversation yet (after setupComplete it lives on this key's project).
+  const tryNextKey = (reason) => {
+    if (call.answered || call.appLeft || !replayable || attempt + 1 >= order.length) return false;
+    noteKeyRefused(order[attempt], reason, code);
+    attempt++;
+    connect([...opening]);
+    return true;
+  };
+
+  function connect(replay) {
+    const entry = order[attempt];
+    const ws = new WebSocket(liveUrl(entry.key));
+    upstream = ws;
+    open = false;
+    call.key = entry.name;
+    if (call.keyEntry !== entry) {           // moved to another key: its share moves too
+      releaseKey(call.keyEntry);
+      call.keyEntry = entry;
+      takeKey(entry);
+    }
     pending.length = 0;
-  });
-  upstream.on('message', (data, isBinary) => {
-    stats.down++; logFrame(data, '←');
-    // Only small frames are looked at, and only until Google has answered the setup.
-    if (!call.answered && data.length <= AUDIO_SIZE_HINT && data.toString().includes('setupComplete')) call.answered = true;
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
-  });
-  upstream.on('close', (c, r) => {
-    console.log(`[${code}] upstream closed ${c} ${String(r).slice(0,80)} | totals up=${stats.up}(audio ${stats.upAudio}) down=${stats.down}(audio ${stats.downAudio})`);
-    const quota = c !== 1000 && isQuotaReason(r);
-    if (quota) noteQuotaHit(code, isBillingReason(r));
-    // The app hanging up closes this side too; only an end Google chose says anything about Google.
-    callEnded(call, call.appLeft || c === 1000 ? 'ok' : quota ? 'quota' : call.answered ? 'dropped' : 'no-start');
-    try { clientWs.close(c >= 1000 && c <= 4999 ? c : 1011, String(r).slice(0, 100)); } catch {}
-  });
-  // A quota refusal can also come before the socket opens, as an HTTP 429 ("Unexpected server
-  // response: 429"). The app is told the reason too, so it can say "today's limit" in words.
-  upstream.on('error', (e) => {
-    console.error(`[${code}] upstream error`, e.message);
-    const quota = isQuotaReason(e.message);
-    if (quota) noteQuotaHit(code, isBillingReason(e.message));
-    callEnded(call, call.appLeft ? 'ok' : quota ? 'quota' : call.answered ? 'dropped' : 'no-start');
-    try { clientWs.close(1011, quota ? 'quota exceeded' : undefined); } catch {}
-  });
+    pending.push(...replay);
+    const current = () => upstream === ws;  // a connection given up on is ignored from then on
+
+    ws.on('open', () => {
+      if (!current()) return;
+      open = true;
+      for (const [data, isBinary] of pending) ws.send(data, { binary: isBinary });
+      pending.length = 0;
+    });
+    ws.on('message', (data, isBinary) => {
+      if (!current()) return;
+      stats.down++; logFrame(data, '←');
+      // Only small frames are looked at: the answer to the setup, and new resumption handles.
+      if (data.length <= AUDIO_SIZE_HINT) {
+        const text = data.toString();
+        if (!call.answered && text.includes('setupComplete')) { call.answered = true; opening.length = 0; }
+        if (text.includes('sessionResumptionUpdate')) {
+          try {
+            const u = JSON.parse(text).sessionResumptionUpdate;
+            if (u?.resumable && u.newHandle) rememberHandle(u.newHandle, entry.name);
+          } catch { /* not JSON */ }
+        }
+      }
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
+    });
+    ws.on('close', (c, r) => {
+      if (!current()) return;
+      const reason = String(r);
+      console.log(`[${code}] upstream (${entry.name} key) closed ${c} ${reason.slice(0,80)} | ${totals()}`);
+      const refused = c !== 1000 && (isQuotaReason(reason) || isKeyProblem(reason));
+      if (refused && tryNextKey(reason)) return;
+      const quota = c !== 1000 && isQuotaReason(reason);
+      if (quota) noteQuotaHit(code, isBillingReason(reason));
+      // The app hanging up closes this side too; only an end Google chose says anything about Google.
+      callEnded(call, call.appLeft || c === 1000 ? 'ok' : quota ? 'quota' : call.answered ? 'dropped' : 'no-start');
+      try { clientWs.close(c >= 1000 && c <= 4999 ? c : 1011, reason.slice(0, 100)); } catch {}
+    });
+    // A refusal can also come before the socket opens, as an HTTP status ("Unexpected server
+    // response: 429"). The app is told the reason too, so it can say "today's limit" in words.
+    ws.on('error', (e) => {
+      if (!current()) return;
+      console.error(`[${code}] upstream (${entry.name} key) error`, e.message);
+      if ((isQuotaReason(e.message) || isKeyProblem(e.message)) && tryNextKey(e.message)) return;
+      const quota = isQuotaReason(e.message);
+      if (quota) noteQuotaHit(code, isBillingReason(e.message));
+      callEnded(call, call.appLeft ? 'ok' : quota ? 'quota' : call.answered ? 'dropped' : 'no-start');
+      try { clientWs.close(1011, quota ? 'quota exceeded' : undefined); } catch {}
+    });
+  }
 
   clientWs.on('message', (data, isBinary) => {
     stats.up++; logFrame(data, '→');
-    // The app's first frame is its setup; one carrying a resumption handle continues an earlier call.
+    // The app's first frame is its setup; one carrying a resumption handle continues an earlier
+    // call, which has to go back to the key whose project issued that handle.
     if (!call.sawSetup) {
       call.sawSetup = true;
-      try { call.resumed = Boolean(JSON.parse(data.toString()).setup?.sessionResumption?.handle); } catch { /* not JSON: a new call */ }
+      let handle;
+      try { handle = JSON.parse(data.toString()).setup?.sessionResumption?.handle; } catch { /* not JSON: a new call */ }
+      call.resumed = Boolean(handle);
+      const owner = keyForHandle(handle);
+      if (owner && owner !== order[attempt]) {
+        const old = upstream;
+        order = [owner, ...order.filter(k => k !== owner)];
+        attempt = 0;
+        connect([]);
+        try { old.terminate(); } catch {}  // nothing was sent on it yet
+      }
+    }
+    if (!call.answered && replayable) {
+      if (opening.length < MAX_OPENING_FRAMES) opening.push([data, isBinary]);
+      else { replayable = false; opening.length = 0; }
     }
     if (open && upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
     else pending.push([data, isBinary]);
   });
   clientWs.on('close', () => {
-    console.log(`[${code}] app disconnected | totals up=${stats.up}(audio ${stats.upAudio}) down=${stats.down}(audio ${stats.downAudio})`);
+    console.log(`[${code}] app disconnected | ${totals()}`);
     call.appLeft = true;
     callEnded(call, 'ok');
     try { upstream.close(); } catch {}
   });
   clientWs.on('error', () => { call.appLeft = true; callEnded(call, 'ok'); try { upstream.close(); } catch {} });
 
+  connect([]);
   console.log(`[live] bridged code=${code}`);
 }
 

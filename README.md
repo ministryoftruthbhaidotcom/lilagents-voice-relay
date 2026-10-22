@@ -73,7 +73,12 @@ dashboard (do **not** upload `.env`). Examples:
 
 ## Config (env)
 
-See [.env.example](.env.example). Key knobs: `GEMINI_API_KEY`, `LIVE_MODEL`,
+See [.env.example](.env.example). Key knobs: `GEMINI_API_KEYS` (free keys, comma-separated, each from its
+own project with no billing, so the free tier pays; new calls go to the least busy one, since the free
+limits are per project) and/or `GEMINI_API_KEY` (one free key, as before), `GEMINI_API_KEY_PAID`
+(optional, a project with credit: calls and `/generate` move to it only when Google refuses every free key
+for its limit, for money or over the key; `KEY_REST_MINUTES`, default 10, is how long a refused key goes
+to the back of the line; `/status` `keys.each` shows each key's calls and refusals by name), `LIVE_MODEL`,
 `VOICE_JOSH`, `VOICE_HOPE` (Gemini voices: Aoede, Charon, Kore, Puck…),
 `EXCLUSIVE_DOWNLOAD_URL`, `ALLOWED_ORIGINS`, `TOKEN_TTL_SECONDS`.
 `/generate` caps: `GENERATE_PER_CLIENT_DAY` (default 300 requests per install per UTC day, about 20 PC
