@@ -118,7 +118,7 @@ const limiter = rateLimit({
 
 // `build` is bumped by hand when this file changes, so a deploy can be confirmed from outside
 // (the app only cares about `ok`).
-app.get('/health', (_req, res) => res.json({ ok: true, build: 10 }));
+app.get('/health', (_req, res) => res.json({ ok: true, build: 11 }));
 
 // ── The shared Gemini voice quota ─────────────────────────────────────────────────────────────
 // Every user's call runs on the one GEMINI_API_KEY above. When its quota runs out, Google closes
@@ -558,9 +558,14 @@ app.post('/generate', generateBurst, express.json({ limit: '6mb' }), async (req,
   const body = JSON.stringify(request);
   const lane = generateLane(model, request);
   const order = keyOrder(lane, now);
+  let freeRefused = 0;
   try {
     for (let i = 0; ; i++) {
-      order[i].lastUsed = Date.now();       // the next step goes to another free key
+      // A key another step has put to rest for this lane since `order` was made (several searches
+      // at once) is skipped while something not resting is still ahead.
+      const t = Date.now();
+      if (i > 0 && restUntil(order[i], lane) > t && order.slice(i + 1).some(k => restUntil(k, lane) <= t)) continue;
+      order[i].lastUsed = t;                // the next step goes to another free key
       const r = await fetch(`${GEMINI_REST}/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': order[i].key },
@@ -572,6 +577,16 @@ app.post('/generate', generateBurst, express.json({ limit: '6mb' }), async (req,
       // else (a bad request, Google busy) would fail there too, so it goes back to the app as it is.
       if (!r.ok && i + 1 < order.length && (r.status === 429 || isQuotaReason(text) || isKeyProblem(text))) {
         noteKeyRefused(order[i], text, 'generate', lane);
+        // Steps share one free tier: when two different free projects refuse the same kind of step,
+        // the rest will too (searches on 2026-10-22: no free search allowance on any of them). All
+        // free keys rest for this lane and the step goes to the paid key now, instead of five
+        // round trips first. Calls ('live') are not judged this way: each project's call limit is
+        // its own, so one full project says nothing about the others.
+        if (!order[i].paid && ++freeRefused >= 2) {
+          for (const k of KEYS) if (!k.paid && restUntil(k, lane) <= t) k.rests.set(lane, t + KEY_REST_MS);
+          const paidAt = order.findIndex((k, j) => j > i && k.paid);
+          if (paidAt > i + 1) i = paidAt - 1;
+        }
         continue;
       }
       if (!r.ok) {
